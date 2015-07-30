@@ -64,6 +64,8 @@ class Robot : public Module {
 
         void compute_arc(Gcode* gcode, float offset[], float target[]);
 
+        void correct_backlash(float actuator_pos[], float unit_vec[]);         // Backlash Functionality
+
         float theta(float x, float y);
         void select_plane(uint8_t axis_0, uint8_t axis_1, uint8_t axis_2);
         void clearToolOffset();
@@ -72,6 +74,7 @@ class Robot : public Module {
         typedef std::tuple<float, float, bool> saved_state_t; // save current feedrate and absolute mode
         std::stack<saved_state_t> state_stack;               // saves state from M120
         float last_milestone[3];                             // Last position, in millimeters
+
         float transformed_last_milestone[3];                 // Last transformed position
         int8_t motion_mode;                                  // Motion mode for the current received Gcode
         uint8_t plane_axis_0, plane_axis_1, plane_axis_2;    // Current plane ( XY, XZ, YZ )
@@ -95,6 +98,13 @@ class Robot : public Module {
         // Used by Stepper, Planner
         friend class Planner;
         friend class Stepper;
+
+        float backlash[3];					// Backlash Functionality
+        float backlash_feedrate[3];			// Backlash Functionality
+        bool last_milestone_directions[3]; 	// Backlash Functionality
+        float last_milestone_actuators[3];  // Backlash Functionality
+        bool backlash_active;				// Backlash Functionality
+        bool backlash_wait;
 
         StepperMotor* alpha_stepper_motor;
         StepperMotor* beta_stepper_motor;

@@ -79,6 +79,13 @@ using std::string;
 #define  beta_max_rate_checksum              CHECKSUM("beta_max_rate")
 #define  gamma_max_rate_checksum             CHECKSUM("gamma_max_rate")
 
+#define  alpha_backlash_checksum			 CHECKSUM("alpha_backlash")
+#define  alpha_backlash_feedrate_checksum	 CHECKSUM("alpha_backlash_feedrate")
+#define  beta_backlash_checksum			 	 CHECKSUM("beta_backlash")
+#define  beta_backlash_feedrate_checksum	 CHECKSUM("beta_backlash_feedrate")
+#define  gamma_backlash_checksum			 CHECKSUM("gamma_backlash")
+#define  gamma_backlash_feedrate_checksum	 CHECKSUM("gamma_backlash_feedrate")
+
 
 // new-style actuator stuff
 #define  actuator_checksum                   CHEKCSUM("actuator")
@@ -129,11 +136,14 @@ Robot::Robot()
     this->select_plane(X_AXIS, Y_AXIS, Z_AXIS);
     clear_vector(this->last_milestone);
     clear_vector(this->transformed_last_milestone);
+    clear_vector(this->last_milestone_directions);
+    clear_vector(this->last_milestone_actuators);
     this->arm_solution = NULL;
     seconds_per_minute = 60.0F;
     this->clearToolOffset();
     this->compensationTransform= nullptr;
     this->halted= false;
+    this->backlash_wait = true;
 }
 
 //Called when the module has just been loaded
@@ -193,6 +203,7 @@ void Robot::on_config_reload(void *argument)
     this->max_speeds[Y_AXIS]  = THEKERNEL->config->value(y_axis_max_speed_checksum    )->by_default(60000.0F)->as_number() / 60.0F;
     this->max_speeds[Z_AXIS]  = THEKERNEL->config->value(z_axis_max_speed_checksum    )->by_default(  300.0F)->as_number() / 60.0F;
 
+
     Pin alpha_step_pin;
     Pin alpha_dir_pin;
     Pin alpha_en_pin;
@@ -233,6 +244,15 @@ void Robot::on_config_reload(void *argument)
     beta_stepper_motor->set_max_rate(THEKERNEL->config->value(beta_max_rate_checksum )->by_default(30000.0F)->as_number() / 60.0F);
     gamma_stepper_motor->set_max_rate(THEKERNEL->config->value(gamma_max_rate_checksum)->by_default(30000.0F)->as_number() / 60.0F);
     check_max_actuator_speeds(); // check the configs are sane
+
+
+    this->backlash[ALPHA_STEPPER] = THEKERNEL->config->value(alpha_backlash_checksum)->by_default(    0.0F)->as_number();
+    this->backlash[BETA_STEPPER] =  THEKERNEL->config->value(beta_backlash_checksum)->by_default(    0.0F)->as_number();
+    this->backlash[GAMMA_STEPPER] = THEKERNEL->config->value(gamma_backlash_checksum)->by_default(    0.0F)->as_number();
+    this->backlash_feedrate[ALPHA_STEPPER] = THEKERNEL->config->value(alpha_backlash_feedrate_checksum)->by_default(alpha_stepper_motor->get_max_rate())->as_number();
+    this->backlash_feedrate[BETA_STEPPER] =  THEKERNEL->config->value(beta_backlash_feedrate_checksum)->by_default(beta_stepper_motor->get_max_rate())->as_number();
+    this->backlash_feedrate[GAMMA_STEPPER] = THEKERNEL->config->value(gamma_backlash_feedrate_checksum)->by_default(gamma_stepper_motor->get_max_rate())->as_number();
+    this->backlash_active = this->backlash[ALPHA_STEPPER] != 0.0F || this->backlash[BETA_STEPPER] != 0.0F ||  this->backlash[GAMMA_STEPPER] != 0.0F;
 
     actuators.clear();
     actuators.push_back(alpha_stepper_motor);
@@ -323,8 +343,10 @@ void Robot::on_set_public_data(void *argument)
 
         float actuator_pos[3];
         arm_solution->cartesian_to_actuator(last_milestone, actuator_pos);
-        for (int i = 0; i < 3; i++)
+        for (int i = 0; i < 3; i++) {
             actuators[i]->change_last_milestone(actuator_pos[i]);
+            this->last_milestone_actuators[i] = actuator_pos[i];
+        }
 
         pdr->set_taken();
     }
@@ -649,8 +671,10 @@ void Robot::reset_axis_position(float x, float y, float z)
 
     float actuator_pos[3];
     arm_solution->cartesian_to_actuator(this->last_milestone, actuator_pos);
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < 3; i++) {
         actuators[i]->change_last_milestone(actuator_pos[i]);
+    	this->last_milestone_actuators[i]=actuator_pos[i];
+   }
 }
 
 // Reset the position for an axis (used in homing and G92)
@@ -662,8 +686,10 @@ void Robot::reset_axis_position(float position, int axis)
     float actuator_pos[3];
     arm_solution->cartesian_to_actuator(this->last_milestone, actuator_pos);
 
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < 3; i++) {
         actuators[i]->change_last_milestone(actuator_pos[i]);
+        this->last_milestone_actuators[i]=actuator_pos[i];
+    }
 }
 
 // Use FK to find out where actuator is and reset lastmilestone to match
@@ -675,9 +701,70 @@ void Robot::reset_position_from_current_actuator_position()
 
     // now reset actuator correctly, NOTE this may lose a little precision
     arm_solution->cartesian_to_actuator(this->last_milestone, actuator_pos);
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < 3; i++) {
         actuators[i]->change_last_milestone(actuator_pos[i]);
+    	this->last_milestone_actuators[i]=actuator_pos[i];
+    }
 }
+
+void Robot::correct_backlash(float actuator_pos[], float unit_vec[]) {
+	 // initiliaze directions
+	    float correction_target[3];
+	    float deltas_corr[3];
+	    float actuator_pos_uncorr[3];
+	    bool target_dir[3];
+
+	    bool anychange = false;
+	    float rate_mm_s_corr = 9999999999.0;
+
+	    memset(deltas_corr,0,sizeof(deltas_corr));
+	    memcpy(correction_target,this->last_milestone_actuators,sizeof(correction_target));
+	    memcpy(actuator_pos_uncorr,actuator_pos,sizeof(actuator_pos_uncorr));
+
+	    for (int actuator = 0; actuator <= 2; actuator++) {
+	    	if (this->backlash[actuator] == 0.0F)  // ignore disabled actuators
+	    		continue;
+
+
+	    	float dir = this->last_milestone_actuators[actuator] - actuator_pos[actuator]; // detect movement direction from uncorrected vector
+	    	if (dir >= 0)   // normalize to -1 and 1
+	    		dir = -1;
+	    	else
+	    		dir = 1;
+
+
+	    	bool dirb = dir >= 0;  // cast to bool
+
+	    	target_dir[actuator] = dirb;   // save to direction vector for save
+
+	    	if (dirb && !this->last_milestone_directions[actuator]) { // set the correction movement vector
+	    		correction_target[actuator] += this->backlash[actuator];
+				anychange = true;														  // mark for correct. move
+				deltas_corr[actuator] = this->backlash[actuator];						  // deltas for movement dist
+
+				if (rate_mm_s_corr > this->backlash_feedrate[actuator])
+					rate_mm_s_corr = this->backlash_feedrate[actuator];
+	    	} else if (!dirb && this->last_milestone_directions[actuator]) {
+	    		correction_target[actuator] = this->last_milestone_actuators[actuator];
+				anychange = true;														  // mark for correct. move
+				deltas_corr[actuator] = this->backlash[actuator];						  // deltas for movement dist
+
+				if (rate_mm_s_corr > this->backlash_feedrate[actuator])
+					rate_mm_s_corr = this->backlash_feedrate[actuator];
+	    	}
+
+	    	if (dirb)
+	    		actuator_pos[actuator] += this->backlash[actuator];           			  // correct the actuator vector
+	    }
+	    float millimeters_of_travel_corr = sqrtf( powf( deltas_corr[X_AXIS], 2 ) +  powf( deltas_corr[Y_AXIS], 2 ) +  powf( deltas_corr[Z_AXIS], 2 ) );
+	    // add a fake block
+	    if (anychange) {
+	        THEKERNEL->planner->append_block( correction_target, rate_mm_s_corr, millimeters_of_travel_corr, unit_vec );
+	    }
+	    memcpy(this->last_milestone_directions,target_dir, sizeof(this->last_milestone_directions));
+	    memcpy(this->last_milestone_actuators,actuator_pos_uncorr, sizeof(this->last_milestone_actuators));
+}
+
 
 // Convert target from millimeters to steps, and append this to the planner
 void Robot::append_milestone( float target[], float rate_mm_s )
@@ -724,6 +811,12 @@ void Robot::append_milestone( float target[], float rate_mm_s )
     // find actuator position given cartesian position, use actual adjusted target
     arm_solution->cartesian_to_actuator( transformed_target, actuator_pos );
 
+
+
+
+    if (this->backlash_active)
+    	correct_backlash(actuator_pos, unit_vec);
+
     // check per-actuator speed limits
     for (int actuator = 0; actuator <= 2; actuator++) {
         float actuator_rate  = fabs(actuator_pos[actuator] - actuators[actuator]->last_milestone_mm) * rate_mm_s / millimeters_of_travel;
@@ -733,10 +826,12 @@ void Robot::append_milestone( float target[], float rate_mm_s )
     }
 
     // Append the block to the planner
-    THEKERNEL->planner->append_block( actuator_pos, rate_mm_s, millimeters_of_travel, unit_vec );
+    THEKERNEL->planner->append_block(actuator_pos, rate_mm_s, millimeters_of_travel, unit_vec );
 
     // Update the last_milestone to the current target for the next time we use last_milestone, use the requested target not the adjusted one
+
     memcpy(this->last_milestone, target, sizeof(this->last_milestone)); // this->last_milestone[] = target[];
+
 
 }
 
